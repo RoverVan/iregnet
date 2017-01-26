@@ -6,6 +6,7 @@
  * We use 2 spaces per tab, and expand the tabs
  */
 #include "iregnet.h"
+#include <ctime>
 
 #define BIG 1e35
 
@@ -21,6 +22,11 @@ standardize_y (Rcpp::NumericMatrix &y, double *ym, double &mean_y);
 static inline double compute_lambda_max(Rcpp::NumericMatrix X, double *w, double *z,
                                         double *eta, bool intercept, double &alpha,
                                         ull n_vars, ull n_obs, bool debug);
+
+void print_profiler_result(clock_t start_global_profiler,
+                             clock_t end_global_profilerclock_t,
+                             clock_t procedure_profiler[],
+                             clock_t loop_profiler[]);
 
 double
 identity (double y)
@@ -94,6 +100,12 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
         int num_lambda,        double eps_lambda
         )
 {
+  clock_t start_global_profiler = clock(),//Start Record
+          end_global_profiler,
+          start_loop_profiler,
+          end_loop_profiler,
+          procedure_profiler[16],
+          loop_profiler[10] = {0};
   /* Initialise some helper variables */
   IREG_DIST transformed_dist;  // Orig dist is the one that is initially given
                                // transformed_dist will be the dist of transformed output variables.
@@ -110,6 +122,7 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
   // get_transformed_dist(orig_dist, transformed_dist, &scale, &estimate_scale, y);
 
   /* Create output variables */
+  procedure_profiler[0] = clock();//Start Record
   if (lambda_path.size() > 0) {
     num_lambda = lambda_path.size();
   }
@@ -130,7 +143,9 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
       out_lambda[i] = lambda_path[i];
     }
   }
+  procedure_profiler[1] = clock();//End Record
 
+  procedure_profiler[2] = clock();//Start Record
   double *beta;                           // Initially points to the first solution
   int *n_iters = INTEGER(out_n_iters);
   double *lambda_seq = REAL(out_lambda);
@@ -151,9 +166,10 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
   double *mean_x = new double [n_vars];
   double *std_x = new double [n_vars];
   IREG_CENSORING *status;
-
+  procedure_profiler[3] = clock();//End Record
 
   /* get censoring types of the observations */
+  procedure_profiler[4] = clock();//Start Record
   if (out_status.size() == 0) {
     status = new IREG_CENSORING [n_obs];
     get_censoring_types(y, status); // NANs denote censored observations in y, NOTE: y will be modified!
@@ -161,15 +177,18 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
   else {
     status = (IREG_CENSORING *) &out_status[0];
   }
+  procedure_profiler[5] = clock();//End Record
 
   /* X is columnwise variance normalized, mean is NOT set to 0
    * y is mean normalized.
    */
+  procedure_profiler[6] = clock();//Start Record
   if (flag_standardize_x) {
     standardize_x(X, mean_x, std_x, intercept);
   }
   mean_y = get_y_means(y, status, ym);
   standardize_y(y, ym, mean_y);
+  procedure_profiler[7] = clock();//End Record
 
   /* SCALE RULES:
    * Whether or not it is estimated depends on estimate_scale. For exponential, this is forced to False and scale fixed to 1. // TODO
@@ -177,6 +196,7 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
    * If you provide no scale, a starting value will be calculated
    * If you provide a scale, it will be used as the initial value
    */
+  procedure_profiler[8] = clock();//Start Record
   if (scale_init == Rcpp::NA) {
     scale_init = get_init_var(ym, status, n_obs, transformed_dist);
     scale_init = 2 * sqrt(scale_init);    // use 2 * sqrt(var) as in survival
@@ -200,18 +220,23 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
   for (ull i = 0; i < n_obs; ++i) {
     eta[i] = w[i] = z[i] = 0;
   }
+  procedure_profiler[9] = clock();//End Record
 
   /******************************************************************************************/
   /* Iterate over grid of lambda values */
+  procedure_profiler[10] = clock();//Start Record
   bool flag_beta_converged = 0;
   double sol_num, sol_denom;
   double beta_new;
   double old_scale;
   double lambda_max_unscaled;
   double eps_ratio = std::pow(eps_lambda, 1.0 / (num_lambda-1));
+  procedure_profiler[11] = clock();//End Record
 
+  procedure_profiler[12] = clock();//Start Record
   for (int m = 0; m < num_lambda + 1; ++m) {
     /* Compute the lambda path */
+    start_loop_profiler = clock();//Start Record
     if (lambda_path.size() == 0) {
 
       /* Do an initial fit with lambda set to BIG, will fit scale and intercept if applicable */
@@ -232,15 +257,20 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
         lambda_seq[m] = lambda_seq[m - 1] * eps_ratio;
       }
     }
+    end_loop_profiler = clock();//End Record
+    loop_profiler[0] += end_loop_profiler - start_loop_profiler;//Store Record Value
 
     /* Initialize the solution at this lambda using previous lambda solution */
     // We need to explicitly do this because we need to store all the solutions separately
+    start_loop_profiler = clock();//Start Record
     if (m != 0) {                         // Initialise solutions using previous value
       for (ull i = 0; i < n_vars; ++i) {
         beta[i + n_vars] = beta[i];
       }
       beta = beta + n_vars;   // go to the next column
     }
+    end_loop_profiler = clock();//End Record
+    loop_profiler[1] += end_loop_profiler - start_loop_profiler;
 
     /* CYCLIC COORDINATE DESCENT: Repeat until convergence of beta */
     n_iters[m] = 0;
@@ -252,10 +282,14 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
       old_scale = scale;
 
       // IRLS: Reweighting step: calculate w and z again (beta & hence eta would have changed)  TODO: make dg ddg, local so that we can save computations?
+      start_loop_profiler = clock();//Start Record
       loglik = compute_grad_response(w, z, &scale_update, REAL(y), REAL(y) + n_obs, eta, scale,     // TODO:store a ptr to y?
                             status, n_obs, transformed_dist, NULL, debug==1 && m == 0);
+      end_loop_profiler = clock();//End Record
+      loop_profiler[2] += end_loop_profiler - start_loop_profiler;//Store Record Value
       /* iterate over beta elementwise and update using soft thresholding solution */
       for (ull k = 0; k < n_vars; ++k) {
+        start_loop_profiler = clock();//Start Record
         sol_num = sol_denom = 0;
         for (ull i = 0; i < n_obs; ++i) {
           eta[i] = eta[i] - X(i, k) * beta[k];  // calculate eta_i without the beta_k contribution
@@ -265,10 +299,13 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
 
         // Note: The signs given in the coxnet paper are incorrect, since the subdifferential should have a negative sign.
         sol_num *= -1; sol_denom *= -1;
+        end_loop_profiler = clock();//End Record
+        loop_profiler[3] += end_loop_profiler - start_loop_profiler;//Store Record Value
 
         // if (debug == 1 && m == 0)
         //   std::cerr << n_iters[m] << " " << k << " " << "sols " << sol_num << " " << sol_denom << "\n";
         /* The intercept should not be regularized, and hence is calculated directly */
+        start_loop_profiler = clock();//Start Record
         if (intercept && k == 0) {
           beta_new = sol_num / sol_denom;
 
@@ -276,42 +313,57 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
           beta_new = soft_threshold(sol_num, lambda_seq[m] * alpha) /
                      (sol_denom + lambda_seq[m] * (1 - alpha));
         }
+        end_loop_profiler = clock();//End Record
+        loop_profiler[4] += end_loop_profiler - start_loop_profiler;//Store Record Value
 
         // if any beta_k has not converged, we will come back for another cycle.
+        start_loop_profiler = clock();//Start Record
 	double abs_change = fabs(beta_new - beta[k]);
         if (abs_change > threshold) {
 	  if(debug==1 && max_iter==n_iters[m])printf("iter=%d lambda=%d beta_%lld not converged, abs_change=%f > %f=threshold\n", n_iters[m], m, k, abs_change, threshold);
           flag_beta_converged = 0;
           beta[k] = beta_new;
         }
+        end_loop_profiler = clock();//End Record
+        loop_profiler[5] += end_loop_profiler - start_loop_profiler;//Store Record Value
 
         // if (debug==1 && m == 1)
         //   std::cerr << n_iters[m] << " " << k << " " << " BETA " << beta[k] << "\n";
 
+        start_loop_profiler = clock();//Start Record
         for (ull i = 0; i < n_obs; ++i) {
           eta[i] = eta[i] + X(i, k) * beta[k];  // this will contain the new beta_k
           // if (debug==1 && m==0) {
           //   std::cerr << n_iters[m] << " " << i << " " << "ETA" <<  eta[i] << "\n";
           // }
         }
+        end_loop_profiler = clock();//End Record
+        loop_profiler[6] += end_loop_profiler - start_loop_profiler;//Store Record Value
 
       }   // end for: beta_k solution
 
+      start_loop_profiler = clock();//Start Record
       if (estimate_scale) {
         log_scale += scale_update; scale = exp(log_scale);
 
         // if (fabs(scale - old_scale) > threshold) {    // TODO: Maybe should be different for sigma?
-	double abs_change = fabs(scale - old_scale);
+	  double abs_change = fabs(scale - old_scale);
         if (abs_change > threshold) {    // TODO: Maybe should be different for sigma?
-	  if(debug==1 && max_iter==n_iters[m])printf("iter=%d lambda=%d scale not converged, abs_change=%f > %f=threshold\n", n_iters[m], m, abs_change, threshold);
-          flag_beta_converged = 0;
+          if(debug==1 && max_iter==n_iters[m])printf("iter=%d lambda=%d scale not converged, abs_change=%f > %f=threshold\n", n_iters[m], m, abs_change, threshold);
+            flag_beta_converged = 0;
         }
       }
+      end_loop_profiler = clock();//End Record
+      loop_profiler[7] += end_loop_profiler - start_loop_profiler;//Store Record Value
     } while ((flag_beta_converged != 1) && (n_iters[m] < max_iter));
 
+    start_loop_profiler = clock();//Start Record
     out_loglik[m] = loglik;
     out_scale[m] = scale;
+    end_loop_profiler = clock();//End Record
+    loop_profiler[8] += end_loop_profiler - start_loop_profiler;//Store Record Value
 
+    start_loop_profiler = clock();//Start Record
     /* Check for errors */
     if (n_iters[m] == max_iter)
       error_status = -1;
@@ -321,8 +373,12 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
       error_status = 1;
       Rcpp::stop("NANs produced");
     }
+    end_loop_profiler = clock();//End Record
+    loop_profiler[9] += end_loop_profiler - start_loop_profiler;//Store Record Value
   } // end for: lambda
+  procedure_profiler[13] = clock();//End Record
 
+  procedure_profiler[14] = clock();//Start Record
   /* Scale the coefs back to the original scale */
   for (ull m = 0; m < num_lambda + 1; ++m) {
     //if (transformed_dist == IREG_DIST_LOGISTIC)
@@ -337,6 +393,7 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
       out_beta(0, m) -= intercept_diff;
     }
   }
+  procedure_profiler[15] = clock();//End Record
 
   /* Free the temporary variables */
   delete [] eta;
@@ -347,6 +404,8 @@ fit_cpp(Rcpp::NumericMatrix X, Rcpp::NumericMatrix y,
   if (out_status == Rcpp::NA) // we would've allocated a new vector in this case
     delete [] status;
 
+  end_global_profiler = clock();//End Record
+  print_profiler_result(start_global_profiler, end_global_profiler, procedure_profiler, loop_profiler);
   return Rcpp::List::create(Rcpp::Named("beta")         = out_beta(Rcpp::_, Rcpp::Range(1,num_lambda)),
                             Rcpp::Named("lambda")       = out_lambda[Rcpp::Range(1,num_lambda)],
                             Rcpp::Named("num_lambda")   = num_lambda,
@@ -537,4 +596,56 @@ compute_lambda_max(Rcpp::NumericMatrix X, double *w, double *z, double *eta,
   lambda_max /= (n_obs * max(alpha, 1e-3));  // prevent divide by zero
 
   return lambda_max;
+}
+
+void print_profiler_result(clock_t start_global_profiler,
+                             clock_t end_global_profiler,
+                             clock_t procedure_profiler[],
+                             clock_t loop_profiler[]){
+  double procedure_time[9];
+
+  //Calculate global time
+  double global_time = double(end_global_profiler - start_global_profiler);
+
+  //Calculate procedure time
+  for (int i = 0; i < 16; i+=2) {
+    procedure_time[i/2] = double(procedure_profiler[i+1] - procedure_profiler[i]);
+  }
+
+  std::cout << "\n---- Profiler in Main Process ----\n";
+
+  std::cout << "Entire fit_cpp() function: " << global_time * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Create output variables: " << (procedure_time[0] / global_time) * 100
+            << "% " << procedure_time[0] * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Initialize temp variables: " << (procedure_time[1] / global_time) * 100
+            << "% " << procedure_time[1] * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Handle Censoring: " << (procedure_time[2] / global_time) * 100
+            << "% " << procedure_time[2] * 1000 * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Standardize variables: " << (procedure_time[3] / global_time) * 100
+            << "% " << procedure_time[3] * 1000 * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Assignment scale & beta &eta: " << (procedure_time[4] / global_time) * 100
+            << "% " << procedure_time[4] * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Initialize lambda loop variables: " << (procedure_time[5] / global_time) * 100
+            << "% " << procedure_time[5] * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Lambda loop: " << (procedure_time[6] / global_time) * 100
+            << "% " << procedure_time[6] * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "Scale back: " << (procedure_time[7] / global_time) * 100
+            << "% " << procedure_time[7] * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  std::cout << "\n---- Profiler in Lambda loop ----\n";
+
+  for (int j = 0; j < 10; j++) {
+   std::cout << "Process "<< j <<" in Loop: " << (double)loop_profiler[j] / global_time * 100
+              << "% " << (double)loop_profiler[j] * 1000 / CLOCKS_PER_SEC << "ms \n";
+
+  }
+
 }
